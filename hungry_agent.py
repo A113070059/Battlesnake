@@ -37,6 +37,10 @@ class HungryAgent(BaseAgent):
     def start(self, game_state: GameState):
         self.agent_states[game_state.game.id] = AgentState(possible_food=[])
 
+    def get_manhattan_distance(coord1, coord2):
+        """Calculates the grid distance between two coordinates."""
+        return abs(coord1['x'] - coord2['x']) + abs(coord1['y'] - coord2['y'])
+
     def move(self, game_state: GameState) -> MoveAction:
         try:
             return self._calculate_move(game_state)
@@ -71,7 +75,7 @@ class HungryAgent(BaseAgent):
         
         result_direction = None
         
-        # STRATEGY 1: Hunt for food (Using Danger Map)
+# STRATEGY 1: Hunt for food (Using Danger Map)
         if is_hungry:
             min_distance = float('inf')
             for food in agent_state.possible_food:
@@ -80,26 +84,50 @@ class HungryAgent(BaseAgent):
                     result_direction = direction
                     min_distance = length
 
-        # STRATEGY 2: Flood fill survival (Using Danger Map)
+        # ==========================================
+        # STRATEGY 2: Hunt Smaller Snakes 
+        # ==========================================
+        # If we aren't hungry, we have the size advantage to hunt!
+        if result_direction is None and not is_hungry:
+            min_hunt_dist = float('inf')
+            best_hunt_dir = None
+            
+            for enemy in game_state.board.snakes:
+                # Find enemies strictly smaller than us (buffer of 1)
+                if enemy.id != game_state.you.id and my_length > (enemy.length + 1):
+                    
+                    # Check all 4 possible next steps using your existing DIRECTION_OFFSETS
+                    for d, (dx, dy) in DIRECTION_OFFSETS.items():
+                        nx = head.x + dx
+                        ny = head.y + dy
+                        
+                        # 1. Is the step physically on the board?
+                        if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
+                            
+                            # 2. Is the step safe according to the Danger Map?
+                            # (If it's safe, the array value should be False/0)
+                            if not danger_map[ny, nx]: 
+                                
+                                # 3. Calculate Manhattan distance from this step to enemy head
+                                dist = abs(nx - enemy.head.x) + abs(ny - enemy.head.y)
+                                
+                                if dist < min_hunt_dist:
+                                    min_hunt_dist = dist
+                                    best_hunt_dir = d
+                                    
+            # If we found a safe path toward prey, lock it in!
+            if best_hunt_dir is not None:
+                result_direction = best_hunt_dir
+        # ==========================================
+
+        # STRATEGY 3: Flood fill survival (Using Danger Map)
+        # We only do this now if we aren't hungry AND there are no smaller snakes to hunt
         if result_direction is None:
             result_direction = self.get_best_survival_move(game_state, danger_map)
             
-        # STRATEGY 3: Panic Mode Survival (Using Strict Map - ignores danger zones)
+        # STRATEGY 4: Panic Mode Survival (Using Strict Map - ignores danger zones)
         if result_direction is None:
             result_direction = self.get_best_survival_move(game_state, strict_map)
-            
-        # ABSOLUTE FALLBACK: Pick ANY physical space that isn't our neck/walls
-        if result_direction is None:
-            for d, (dx, dy) in DIRECTION_OFFSETS.items():
-                nx = head.x + dx
-                ny = head.y + dy
-                if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
-                    if not strict_map[ny, nx]:
-                        result_direction = d
-                        break
-                        
-        if result_direction is None:
-            result_direction = Direction.UP
 
         my_name = game_state.you.name
         move_str = getattr(result_direction, 'name', str(result_direction))
