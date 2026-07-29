@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass
 import heapq
 import numpy as np
@@ -37,11 +38,7 @@ class HungryAgent(BaseAgent):
     def start(self, game_state: GameState):
         self.agent_states[game_state.game.id] = AgentState(possible_food=[])
 
-    def get_manhattan_distance(self, coord1, coord2):
-        """Calculates the grid distance between two coordinates."""
-        return abs(coord1['x'] - coord2['x']) + abs(coord1['y'] - coord2['y'])
-
-    def get_obstacle_map(self, game_state: GameState, use_danger_zones: bool = False) -> np.ndarray:
+    def get_obstacle_map(self, game_state: GameState, use_danger_zones: bool = False, my_length: int = 0) -> np.ndarray:
         board_height = game_state.board.height
         board_width = game_state.board.width
         obstacle_map = np.zeros((board_height, board_width), dtype=bool)
@@ -65,11 +62,12 @@ class HungryAgent(BaseAgent):
             for snake in game_state.board.snakes:
                 if snake.head is None or snake.id == game_state.you.id:
                     continue
-                for dx, dy in DIRECTION_OFFSETS.values():
-                    nx = snake.head.x + dx
-                    ny = snake.head.y + dy
-                    if 0 <= nx < board_width and 0 <= ny < board_height:
-                        danger_map[ny, nx] = True
+                if snake.length >= my_length:
+                    for dx, dy in DIRECTION_OFFSETS.values():
+                        nx = snake.head.x + dx
+                        ny = snake.head.y + dy
+                        if 0 <= nx < board_width and 0 <= ny < board_height:
+                            danger_map[ny, nx] = True
             return danger_map
 
         return obstacle_map
@@ -109,7 +107,7 @@ class HungryAgent(BaseAgent):
         agent_state.possible_food = valid_food
 
         # 2. Build the Maps
-        danger_map = self.get_obstacle_map(game_state, use_danger_zones=True)
+        danger_map = self.get_obstacle_map(game_state, use_danger_zones=True, my_length=my_length)
         strict_map = self.get_obstacle_map(game_state, use_danger_zones=False)
 
         # 3. Assess Hunger
@@ -205,12 +203,12 @@ class HungryAgent(BaseAgent):
             return 0
             
         visited = set()
-        queue = [(start_x, start_y)]
+        queue = deque([(start_x, start_y)])
         visited.add((start_x, start_y))
         space_count = 0
         
         while queue and space_count < max_space:
-            curr_x, curr_y = queue.pop(0)
+            curr_x, curr_y = queue.popleft()
             space_count += 1
             
             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
