@@ -37,9 +37,42 @@ class HungryAgent(BaseAgent):
     def start(self, game_state: GameState):
         self.agent_states[game_state.game.id] = AgentState(possible_food=[])
 
-    def get_manhattan_distance(coord1, coord2):
+    def get_manhattan_distance(self, coord1, coord2):
         """Calculates the grid distance between two coordinates."""
         return abs(coord1['x'] - coord2['x']) + abs(coord1['y'] - coord2['y'])
+
+    def get_obstacle_map(self, game_state: GameState, use_danger_zones: bool = False) -> np.ndarray:
+        board_height = game_state.board.height
+        board_width = game_state.board.width
+        obstacle_map = np.zeros((board_height, board_width), dtype=bool)
+
+        # Mark snake bodies and hazards as blocked.
+        for snake in game_state.board.snakes:
+            for body_part in snake.body:
+                if body_part is None:
+                    continue
+                if 0 <= body_part.x < board_width and 0 <= body_part.y < board_height:
+                    obstacle_map[body_part.y, body_part.x] = True
+
+        for hazard in game_state.board.hazards:
+            if hazard is None:
+                continue
+            if 0 <= hazard.x < board_width and 0 <= hazard.y < board_height:
+                obstacle_map[hazard.y, hazard.x] = True
+
+        if use_danger_zones:
+            danger_map = obstacle_map.copy()
+            for snake in game_state.board.snakes:
+                if snake.head is None or snake.id == game_state.you.id:
+                    continue
+                for dx, dy in DIRECTION_OFFSETS.values():
+                    nx = snake.head.x + dx
+                    ny = snake.head.y + dy
+                    if 0 <= nx < board_width and 0 <= ny < board_height:
+                        danger_map[ny, nx] = True
+            return danger_map
+
+        return obstacle_map
 
     def move(self, game_state: GameState) -> MoveAction:
         try:
@@ -57,10 +90,23 @@ class HungryAgent(BaseAgent):
         head = game_state.you.head
         assert head is not None
 
-        # 1. Update Food Memory (Simplified)
+        # 1. Update Food Memory
         for food in game_state.board.food:
             if food not in agent_state.possible_food:
                 agent_state.possible_food.append(food)
+
+        # 1b. Cleanup stale food in visible range
+        valid_food = []
+        for cached_food in agent_state.possible_food:
+            if cached_food is None:
+                continue
+            dist_to_head = abs(cached_food.x - head.x) + abs(cached_food.y - head.y)
+            if dist_to_head <= 5:
+                if cached_food in game_state.board.food:
+                    valid_food.append(cached_food)
+            else:
+                valid_food.append(cached_food)
+        agent_state.possible_food = valid_food
 
         # 2. Build the Maps
         danger_map = self.get_obstacle_map(game_state, use_danger_zones=True)
@@ -69,107 +115,86 @@ class HungryAgent(BaseAgent):
         # 3. Assess Hunger
         my_health = game_state.you.health
         my_length = game_state.you.length
-        
         largest_enemy_length = max([s.length for s in game_state.board.snakes if s.id != game_state.you.id], default=0)
         is_hungry = (my_health < 40) or (my_length <= largest_enemy_length + 1)
-        
+
         result_direction = None
-        
-# STRATEGY 1: Hunt for food (Using Danger Map)
+        strategy_used = "NONE"
+
+        # STRATEGY 1: Hunt for food (Using Danger Map)
         if is_hungry:
             min_distance = float('inf')
             for food in agent_state.possible_food:
                 direction, length = self.a_star_wrapper(danger_map, head, food)
-                if length < min_distance:
+                if direction is not None and length < min_distance:
                     result_direction = direction
                     min_distance = length
+            if result_direction is not None:
+                strategy_used = "1_A*_FOOD"
 
-        # ==========================================
-        # STRATEGY 2: Hunt Smaller Snakes 
-        # ==========================================
-        # If we aren't hungry, we have the size advantage to hunt!
+        # STRATEGY 2: Hunt Smaller Snakes
         if result_direction is None and not is_hungry:
             min_hunt_dist = float('inf')
             best_hunt_dir = None
-            
             for enemy in game_state.board.snakes:
-                # Find enemies strictly smaller than us (buffer of 1)
-                if enemy.id != game_state.you.id and my_length > (enemy.length + 1):
-                    
-                    # Check all 4 possible next steps using your existing DIRECTION_OFFSETS
-                    for d, (dx, dy) in DIRECTION_OFFSETS.items():
-                        nx = head.x + dx
-                        ny = head.y + dy
-                        
-                        # 1. Is the step physically on the board?
-                        if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
-                            
-                            # 2. Is the step safe according to the Danger Map?
-                            # (If it's safe, the array value should be False/0)
-                            if not danger_map[ny, nx]: 
-                                
-                                # 3. Calculate Manhattan distance from this step to enemy head
-                                dist = abs(nx - enemy.head.x) + abs(ny - enemy.head.y)
-                                
-                                if dist < min_hunt_dist:
-                                    min_hunt_dist = dist
-                                    best_hunt_dir = d
-                                    
-            # If we found a safe path toward prey, lock it in!
+                if enemy.id == game_state.you.id or enemy.length + 1 >= my_length:
+                    continue
+                if enemy.head is None:
+                    continue
+                for d, (dx, dy) in DIRECTION_OFFSETS.items():
+                    nx = head.x + dx
+                    ny = head.y + dy
+                    if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
+                        if not danger_map[ny, nx]:
+                            dist = abs(nx - enemy.head.x) + abs(ny - enemy.head.y)
+                            if dist < min_hunt_dist:
+                                min_hunt_dist = dist
+                                best_hunt_dir = d
             if best_hunt_dir is not None:
                 result_direction = best_hunt_dir
-        # ==========================================
+                strategy_used = "2_HUNT_SNAKES"
 
         # STRATEGY 3: Flood fill survival (Using Danger Map)
-        # We only do this now if we aren't hungry AND there are no smaller snakes to hunt
         if result_direction is None:
             result_direction = self.get_best_survival_move(game_state, danger_map)
-            
-        # STRATEGY 4: Panic Mode Survival (Using Strict Map - ignores danger zones)
+            if result_direction is not None:
+                strategy_used = "3_FLOOD_DANGER"
+
+        # STRATEGY 4: Panic Mode Survival (Using Strict Map)
         if result_direction is None:
             result_direction = self.get_best_survival_move(game_state, strict_map)
+            if result_direction is not None:
+                strategy_used = "4_FLOOD_PANIC"
 
-        my_name = game_state.you.name
+        # ABSOLUTE FALLBACK: Prefer danger-aware open direction first
+        if result_direction is None:
+            for d, (dx, dy) in DIRECTION_OFFSETS.items():
+                nx = head.x + dx
+                ny = head.y + dy
+                if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
+                    if not danger_map[ny, nx] and not strict_map[ny, nx]:
+                        result_direction = d
+                        strategy_used = "5_SAFE_FALLBACK"
+                        break
+
+        if result_direction is None:
+            for d, (dx, dy) in DIRECTION_OFFSETS.items():
+                nx = head.x + dx
+                ny = head.y + dy
+                if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
+                    if not strict_map[ny, nx]:
+                        result_direction = d
+                        strategy_used = "6_LAST_RESORT"
+                        break
+
+        if result_direction is None:
+            result_direction = Direction.UP
+            strategy_used = "7_BLIND_UP"
+
         move_str = getattr(result_direction, 'name', str(result_direction))
-        print(f"Turn {game_state.turn:03d} | {my_name} | Hungry: {is_hungry} | Move: {move_str}")    
+        print(f"Turn {game_state.turn:03d} | Hungry: {is_hungry} | Strat: {strategy_used} | Move: {move_str}")
 
         return MoveAction(move=result_direction)
-
-    def get_obstacle_map(self, game_state: GameState, use_danger_zones: bool) -> np.ndarray:
-        board_height = game_state.board.height
-        board_width = game_state.board.width
-        obstacle_map = np.zeros((board_height, board_width), dtype=bool)
-        my_snake = game_state.you
-        
-        # Mark OUR OWN body explicitly just to be 100% safe
-        for body_part in my_snake.body[:-1]:
-            if 0 <= body_part.x < board_width and 0 <= body_part.y < board_height:
-                obstacle_map[body_part.y, body_part.x] = 1
-
-        # Mark all enemy bodies
-        for snake in game_state.board.snakes:
-            if snake.id == my_snake.id:
-                continue
-                
-            for body_part in snake.body[:-1]:
-                if 0 <= body_part.x < board_width and 0 <= body_part.y < board_height:
-                    obstacle_map[body_part.y, body_part.x] = 1
-            
-            # Danger Zones: ONLY apply if the enemy is STRICTLY LARGER than us
-            if use_danger_zones and snake.length > my_snake.length:
-                head = snake.head
-                if head is not None:
-                    danger_zones = [
-                        (head.x, head.y + 1), 
-                        (head.x, head.y - 1), 
-                        (head.x - 1, head.y), 
-                        (head.x + 1, head.y)  
-                    ]
-                    for dx, dy in danger_zones:
-                        if 0 <= dx < board_width and 0 <= dy < board_height:
-                            obstacle_map[dy, dx] = 1
-
-        return obstacle_map
 
     def get_available_space(self, start_x: int, start_y: int, obstacle_map: np.ndarray, max_space: int) -> int:
         board_height, board_width = obstacle_map.shape
