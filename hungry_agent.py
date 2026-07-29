@@ -106,15 +106,15 @@ class HungryAgent(BaseAgent):
                 valid_food.append(cached_food)
         agent_state.possible_food = valid_food
 
-        # 2. Build the Maps
-        danger_map = self.get_obstacle_map(game_state, use_danger_zones=True, my_length=my_length)
-        strict_map = self.get_obstacle_map(game_state, use_danger_zones=False)
-
-        # 3. Assess Hunger
+        # 2. Assess Hunger & Stats
         my_health = game_state.you.health
         my_length = game_state.you.length
         largest_enemy_length = max([s.length for s in game_state.board.snakes if s.id != game_state.you.id], default=0)
         is_hungry = (my_health < 40) or (my_length <= largest_enemy_length + 1)
+
+        # 3. Build the Maps
+        danger_map = self.get_obstacle_map(game_state, use_danger_zones=True, my_length=my_length)
+        strict_map = self.get_obstacle_map(game_state, use_danger_zones=False)
 
         result_direction = None
         strategy_used = "NONE"
