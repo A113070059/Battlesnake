@@ -72,6 +72,19 @@ class HungryAgent(BaseAgent):
 
         return obstacle_map
 
+    def is_move_safe(self, head: Point, direction: Direction, obstacle_map: np.ndarray, my_length: int) -> bool:
+        dx, dy = DIRECTION_OFFSETS[direction]
+        nx, ny = head.x + dx, head.y + dy
+        board_height, board_width = obstacle_map.shape
+
+        if not (0 <= nx < board_width and 0 <= ny < board_height):
+            return False
+        if obstacle_map[ny, nx]:
+            return False
+
+        available_space = self.get_available_space(nx, ny, obstacle_map, max_space=my_length)
+        return available_space >= my_length
+
     def move(self, game_state: GameState) -> MoveAction:
         try:
             return self._calculate_move(game_state)
@@ -119,18 +132,21 @@ class HungryAgent(BaseAgent):
         result_direction = None
         strategy_used = "NONE"
 
-        # STRATEGY 1: Hunt for food (Using Danger Map)
+        # STRATEGY 1: Hunt for food (Using Danger Map + Safety Lookahead)
         if is_hungry:
             min_distance = float('inf')
+            best_food_dir = None
             for food in agent_state.possible_food:
                 direction, length = self.a_star_wrapper(danger_map, head, food)
                 if direction is not None and length < min_distance:
-                    result_direction = direction
-                    min_distance = length
-            if result_direction is not None:
-                strategy_used = "1_A*_FOOD"
+                    if self.is_move_safe(head, direction, danger_map, my_length):
+                        best_food_dir = direction
+                        min_distance = length
+            if best_food_dir is not None:
+                result_direction = best_food_dir
+                strategy_used = "1_A*_FOOD_SAFE"
 
-        # STRATEGY 2: Hunt Smaller Snakes
+        # STRATEGY 2: Hunt Smaller Snakes (With Safety Lookahead)
         if result_direction is None and not is_hungry:
             min_hunt_dist = float('inf')
             best_hunt_dir = None
@@ -143,14 +159,14 @@ class HungryAgent(BaseAgent):
                     nx = head.x + dx
                     ny = head.y + dy
                     if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
-                        if not danger_map[ny, nx]:
+                        if not danger_map[ny, nx] and self.is_move_safe(head, d, danger_map, my_length):
                             dist = abs(nx - enemy.head.x) + abs(ny - enemy.head.y)
                             if dist < min_hunt_dist:
                                 min_hunt_dist = dist
                                 best_hunt_dir = d
             if best_hunt_dir is not None:
                 result_direction = best_hunt_dir
-                strategy_used = "2_HUNT_SNAKES"
+                strategy_used = "2_HUNT_SNAKES_SAFE"
 
         # STRATEGY 3: Flood fill survival (Using Danger Map)
         if result_direction is None:
@@ -221,22 +237,35 @@ class HungryAgent(BaseAgent):
         return space_count
 
     def get_best_survival_move(self, game_state: GameState, obstacle_map: np.ndarray) -> Direction | None:
+        """Finds the move with the most space, tie-breaking by preferring the center of the board."""
         head = game_state.you.head
         my_length = game_state.you.length
-        
+        board_width = game_state.board.width
+        board_height = game_state.board.height
+
+        center_x, center_y = board_width // 2, board_height // 2
+
         best_direction = None
         max_space_found = -1
-        
+        best_center_dist = float('inf')
+
         for d, (dx, dy) in DIRECTION_OFFSETS.items():
             next_x = head.x + dx
             next_y = head.y + dy
-            
+
             space = self.get_available_space(next_x, next_y, obstacle_map, max_space=my_length)
-            
-            if space > max_space_found and space > 0:
+            if space <= 0:
+                continue
+
+            dist_to_center = abs(next_x - center_x) + abs(next_y - center_y)
+            if space > max_space_found:
                 max_space_found = space
                 best_direction = d
-                
+                best_center_dist = dist_to_center
+            elif space == max_space_found and dist_to_center < best_center_dist:
+                best_direction = d
+                best_center_dist = dist_to_center
+
         return best_direction
 
     def end(self, game_state: GameState):
