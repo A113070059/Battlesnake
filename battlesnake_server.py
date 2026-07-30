@@ -21,8 +21,8 @@ def start_server(agent: BaseAgent, port):
             "apiversion": "1",
             "author": agent.get_author(),
             "color": agent.get_color(),
-            "head": "default",
-            "tail": "default",
+            "head": "pixel",
+            "tail": "pixel",
         }
 
         # filter None values
