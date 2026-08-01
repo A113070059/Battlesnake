@@ -121,6 +121,11 @@ class PPOAgent(BaseAgent):
                     body = []
                 else:
                     alive_count += 1
+                    # Pad body to match s.length to avoid C++ out-of-bounds read in hisss
+                    # In Fog of War, Battlesnake might send only the visible parts of the body,
+                    # but s.length reflects the true length.
+                    while len(body) < s.length:
+                        body.append(body[-1])
                     
                 snakes_alive.append(is_alive)
                 snake_pos[i] = body
