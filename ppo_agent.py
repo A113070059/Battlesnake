@@ -39,7 +39,7 @@ class PPOAgent(BaseAgent):
         # Load configuration
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"Config not found at {self.config_path}")
-        self.config = ExperimentConfig.from_file(self.config_path)
+        self.config = ExperimentConfig.load(self.config_path)
         
         # Initialize observation builder
         self.obs_builder = ObservationBuilder(self.config)
