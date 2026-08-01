@@ -87,8 +87,8 @@ class PPOAgent(BaseAgent):
         game_config.h = game_state.board.height
         game_config.w = game_state.board.width
         # Override config settings if needed
-        if hasattr(game_state.game.ruleset, 'settings'):
-            game_config.view_radius = game_state.game.ruleset.settings.get('viewRadius', self.config.view_radius)
+        if hasattr(game_state.game.ruleset, 'settings') and hasattr(game_state.game.ruleset.settings, 'viewRadius'):
+            game_config.view_radius = game_state.game.ruleset.settings.viewRadius or self.config.view_radius
         
         env = hisss.BattleSnakeGame(game_config)
         
