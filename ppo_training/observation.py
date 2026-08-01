@@ -126,12 +126,21 @@ class ObservationBuilder:
         raw_batch, alive = self._raw_observations(env)
         local_index = alive.index(player)
         raw = raw_batch[local_index].copy()
-        if raw.shape != (
-            self.config.observation_size,
-            self.config.observation_size,
-            self.config.hisss_channels,
-        ):
-            raise ValueError(f"Unexpected Hisss observation shape: {raw.shape}")
+        target_size = self.config.observation_size
+        if raw.shape != (target_size, target_size, self.config.hisss_channels):
+            # If the board is smaller (e.g. 11x11), pad it symmetrically so it matches the 15x15 expected shape
+            pad_w = (target_size - raw.shape[0]) // 2
+            pad_h = (target_size - raw.shape[1]) // 2
+            
+            if pad_w < 0 or pad_h < 0:
+                raise ValueError(f"Board size larger than training configuration ({target_size}x{target_size}) is not supported.")
+                
+            raw = np.pad(
+                raw,
+                ((pad_w, pad_w), (pad_h, pad_h), (0, 0)),
+                mode='constant',
+                constant_values=0
+            )
 
         state = env.get_state()
         own_body = [tuple(map(int, point)) for point in state.snake_pos[player]]
