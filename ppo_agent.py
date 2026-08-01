@@ -26,6 +26,10 @@ except ImportError:
 from battlesnake_types import GameState, MoveAction, Direction, BaseAgent
 from ppo_training.config import ExperimentConfig
 from ppo_training.observation import ExplicitMemory, ObservationBuilder
+import torch
+
+# Limit PyTorch to 1 thread to avoid memory fragmentation/SIGABRT (status 134) on constrained environments like Render
+torch.set_num_threads(1)
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +116,11 @@ class PPOAgent(BaseAgent):
                 s = snakes_list[i]
                 is_alive = True
                 
-                # Filter out None values from body (if they exist)
-                body = [(p.x, p.y) for p in s.body if p is not None]
+                # Filter out None values and out-of-bounds coordinates
+                body = [
+                    (p.x, p.y) for p in s.body 
+                    if p is not None and 0 <= p.x < game_config.w and 0 <= p.y < game_config.h
+                ]
                 
                 # If snake has no valid body parts, it's effectively dead to hisss
                 if not body:
@@ -142,7 +149,10 @@ class PPOAgent(BaseAgent):
             print(f"[{game_id}] Turn {game_state.turn}: Only 1 snake alive. Falling back to UP.")
             return MoveAction(move=Direction.UP)
 
-        food_pos = [[f.x, f.y] for f in game_state.board.food]
+        food_pos = [
+            [f.x, f.y] for f in game_state.board.food 
+            if 0 <= f.x < game_config.w and 0 <= f.y < game_config.h
+        ]
         
         state = BattleSnakeState(
             turn=game_state.turn,
