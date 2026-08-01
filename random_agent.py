@@ -9,7 +9,7 @@ def get_obstacle_map(game_state: GameState):
     for snake in game_state.board.snakes:
         for body_part in snake.body:
             # ADD THIS SAFETY CHECK: Only plot if it's within the board boundaries
-            if 0 <= body_part.y < game_state.board.height and 0 <= body_part.x < game_state.board.width:
+            if body_part is not None and 0 <= body_part.y < game_state.board.height and 0 <= body_part.x < game_state.board.width:
                 obstacle_map[body_part.y, body_part.x] = 1
     
     # print(obstacle_map.astype(int)[::-1])
