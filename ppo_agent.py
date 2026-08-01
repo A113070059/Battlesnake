@@ -82,10 +82,11 @@ class PPOAgent(BaseAgent):
             
         memory = self.memories[game_id]
         
-        # 1. Build the hisss environment state
         game_config = hisss.restricted_standard_config()
         game_config.h = game_state.board.height
         game_config.w = game_state.board.width
+        game_config.all_actions_legal = True
+        
         # Override config settings if needed
         if hasattr(game_state.game.ruleset, 'settings') and hasattr(game_state.game.ruleset.settings, 'viewRadius'):
             game_config.view_radius = game_state.game.ruleset.settings.viewRadius or self.config.view_radius
@@ -154,14 +155,28 @@ class PPOAgent(BaseAgent):
         # It's an approximation, but ObservationBuilder will update memory correctly.
         current_food_set = {(f.x, f.y) for f in game_state.board.food}
         
-        # Get observation
-        obs, inverse_action_map = self.obs_builder.observe(
-            env=env,
-            player=0, # We placed 'you' at index 0
-            memory=memory,
-            announced_food=current_food_set,
-            symmetry=0
-        )
+        try:
+            obs, inverse_action_map = self.obs_builder.observe(
+                env=env,
+                player=0, # We placed 'you' at index 0
+                memory=memory,
+                announced_food=current_food_set,
+                symmetry=0
+            )
+        except ValueError as e:
+            if "terminal Hisss game" in str(e):
+                print("CRASH DETECTED! DUMPING HISSS STATE:")
+                print(f"snakes_alive: {snakes_alive}")
+                print(f"snake_pos: {snake_pos}")
+                print(f"snake_health: {snake_health}")
+                print(f"snake_len: {snake_len}")
+                print(f"food_pos: {food_pos}")
+                print(f"w: {game_config.w}, h: {game_config.h}, num_players: {game_config.num_players}")
+                import sys
+                sys.stdout.flush()
+                # Fallback to UP if hisss fails to avoid crashing the whole turn (though C++ might still crash on GC)
+                return MoveAction(move=Direction.UP)
+            raise
         
         # Predict move
         # PPO predict expects a batched observation, so we add a batch dimension
