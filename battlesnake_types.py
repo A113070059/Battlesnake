@@ -1,8 +1,8 @@
 from enum import Enum
 from abc import abstractmethod
 
-from pydantic import BaseModel
-from typing import List, Optional, Tuple, Union
+from pydantic import AliasChoices, BaseModel, Field
+from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------
 # Misc Models
@@ -12,7 +12,7 @@ class Point(BaseModel):
     y: int
 
 class Food(Point):
-    spawn_turn: Optional[int] = None
+    spawn_turn: int
 
 class EliminatedCause(str, Enum):
     EliminatedByCollision = "snake-collision"
@@ -30,7 +30,7 @@ class EliminationEvent(BaseModel):
 # Snake Model
 # ---------------------------------------------------------
 class SnakeCustomizations(BaseModel):
-    color: Optional[Union[str, list]]
+    color: Tuple[int, int, int]
     head: Optional[str]
     tail: Optional[str]
 
@@ -44,7 +44,13 @@ class Snake(BaseModel):
     head: Optional[Point]
     body: List[Optional[Point]]
     customizations: SnakeCustomizations
-    elimination_event: Optional[EliminationEvent] = None
+    elimination_event: Optional[EliminationEvent] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "elimination_event",
+            "elimination",
+        ),
+    )
 
 # ---------------------------------------------------------
 # Game & Ruleset Models
@@ -62,7 +68,7 @@ class RulesetSettings(BaseModel):
     foodSpawnChance: int
     hazardDamagePerTurn: int
     minimumFood: int
-    viewRadius: Optional[int] = None
+    viewRadius: Optional[int]
     royale: RoyaleSettings
     squad: SquadSettings
 

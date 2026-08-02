@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import sys
 
 import numpy as np
@@ -98,7 +99,15 @@ class PPOAgent(BaseAgent):
         return "#800080"
 
     def get_author(self):
-        return "RL_Trainer"
+        return "MeinKraft"
+
+    @staticmethod
+    def _snake_is_alive(snake) -> bool:
+        """Treat API elimination markers as authoritative when present."""
+        return (
+            getattr(snake, "elimination_event", None) is None
+            and getattr(snake, "elimination", None) is None
+        )
 
     def _register_snake_slots(self, game_state: GameState) -> dict[str, int]:
         """Keep a stable Hisss player slot for each Battlesnake id."""
@@ -131,6 +140,15 @@ class PPOAgent(BaseAgent):
             point is not None
             and 0 <= point.x < width
             and 0 <= point.y < height
+        )
+
+    def _has_hidden_body(self, snake, width: int, height: int) -> bool:
+        """Whether the API body cannot establish the snake's true length."""
+        if not snake.body:
+            return True
+        return any(
+            not self._valid_point(part, width, height)
+            for part in snake.body
         )
 
     @staticmethod
@@ -187,7 +205,12 @@ class PPOAgent(BaseAgent):
                 body.append(placeholder)
 
         reported_length = int(snake.length or 0)
-        target_length = max(1, len(body), reported_length)
+        if self._has_hidden_body(snake, width, height):
+            # The API length is not trustworthy when any body segment is
+            # hidden.  Do not create a long row of duplicate placeholders.
+            target_length = max(1, len(body))
+        else:
+            target_length = max(1, len(body), reported_length)
         if not body:
             body = [placeholder]
         if len(body) < target_length:
@@ -201,7 +224,9 @@ class PPOAgent(BaseAgent):
         obstacle_map = get_obstacle_map(game_state)
         candidates = get_legal_directions(game_state, obstacle_map)
         head = game_state.you.head
-        if head is None:
+        if not self._valid_point(
+            head, game_state.board.width, game_state.board.height
+        ):
             return []
 
         food = {
@@ -210,7 +235,11 @@ class PPOAgent(BaseAgent):
             if self._valid_point(item, game_state.board.width, game_state.board.height)
         }
         hazards = get_hazard_positions(game_state)
-        health = int(game_state.you.health or 0)
+        health = (
+            int(game_state.you.health)
+            if game_state.you.health is not None
+            else 100
+        )
         hazard_damage = int(
             game_state.game.ruleset.settings.hazardDamagePerTurn or 0
         )
@@ -241,14 +270,31 @@ class PPOAgent(BaseAgent):
             # Avoid visible enemy heads and conservative head-to-head ties.
             unsafe_head = False
             for snake in game_state.board.snakes:
-                if snake.id == game_state.you.id or snake.head is None:
+                if (
+                    snake.id == game_state.you.id
+                    or not self._snake_is_alive(snake)
+                    or not self._valid_point(
+                        snake.head,
+                        game_state.board.width,
+                        game_state.board.height,
+                    )
+                ):
                     continue
                 enemy_head = (snake.head.x, snake.head.y)
                 distance = abs(target[0] - enemy_head[0]) + abs(
                     target[1] - enemy_head[1]
                 )
                 if distance == 0 or (
-                    distance == 1 and int(snake.length or 0) >= int(game_state.you.length)
+                    distance == 1
+                    and (
+                        self._has_hidden_body(
+                            snake,
+                            game_state.board.width,
+                            game_state.board.height,
+                        )
+                        or int(snake.length or 0)
+                        >= int(game_state.you.length or 0)
+                    )
                 ):
                     unsafe_head = True
                     break
@@ -256,14 +302,132 @@ class PPOAgent(BaseAgent):
                 safe.append(direction)
         return safe
 
+    def _sanitize_snake_for_safety(self, snake, width: int, height: int):
+        """Replace hidden/invalid points before HungryAgent sees the state."""
+        sanitized_body = [
+            part if self._valid_point(part, width, height) else None
+            for part in (snake.body or [])
+        ]
+        sanitized_head = (
+            snake.head
+            if self._valid_point(snake.head, width, height)
+            else None
+        )
+        return snake.model_copy(
+            update={
+                "body": sanitized_body,
+                "head": sanitized_head,
+            }
+        )
+
+    def _safety_state(self, game_state: GameState) -> GameState:
+        """Remove dead snakes and sanitize all coordinates for HungryAgent."""
+        width = game_state.board.width
+        height = game_state.board.height
+        live_snakes = [
+            self._sanitize_snake_for_safety(snake, width, height)
+            for snake in game_state.board.snakes
+            if self._snake_is_alive(snake)
+        ]
+        board = game_state.board.model_copy(update={"snakes": live_snakes})
+        sanitized_you = self._sanitize_snake_for_safety(
+            game_state.you,
+            width,
+            height,
+        )
+        return game_state.model_copy(
+            update={
+                "board": board,
+                "you": sanitized_you,
+            }
+        )
+
+    def _head_to_head_directions(
+        self, game_state: GameState
+    ) -> list[Direction]:
+        """Find moves where a live enemy head could contest our destination.
+
+        Hisss resolves a head-to-head when both snakes move onto the same
+        destination cell.  Therefore the useful fallback case is an empty
+        cell adjacent to an enemy head, not simply moving into the enemy's
+        current head cell.  A known length advantage is preferred; hidden or
+        equal lengths remain possible but less certain.
+        """
+        board = game_state.board
+        own_head = game_state.you.head
+        if not self._valid_point(own_head, board.width, board.height):
+            return []
+
+        own_length = int(game_state.you.length or 0)
+        occupied: set[tuple[int, int]] = set()
+        if self._snake_is_alive(game_state.you):
+            for part in game_state.you.body:
+                if self._valid_point(part, board.width, board.height):
+                    occupied.add((int(part.x), int(part.y)))
+        enemies = []
+        for snake in board.snakes:
+            if not self._snake_is_alive(snake):
+                continue
+            for part in snake.body:
+                if self._valid_point(part, board.width, board.height):
+                    occupied.add((int(part.x), int(part.y)))
+            if snake.id == game_state.you.id:
+                continue
+            if self._valid_point(snake.head, board.width, board.height):
+                enemies.append(snake)
+
+        ranked: list[tuple[int, Direction]] = []
+        for direction in Direction:
+            target = (own_head.x + direction.dx, own_head.y + direction.dy)
+            if not (
+                0 <= target[0] < board.width
+                and 0 <= target[1] < board.height
+            ):
+                continue
+
+            # A head-to-head requires an open destination.  Moving into a
+            # known body is still an ordinary body collision, not a useful
+            # head-to-head opportunity.
+            if target in occupied:
+                continue
+
+            for enemy in enemies:
+                enemy_head = (int(enemy.head.x), int(enemy.head.y))
+                distance = abs(target[0] - enemy_head[0]) + abs(
+                    target[1] - enemy_head[1]
+                )
+                if distance != 1:
+                    continue
+
+                if self._has_hidden_body(enemy, board.width, board.height):
+                    priority = 1  # Possible, but true enemy length is unknown.
+                elif own_length > int(enemy.length or 0):
+                    priority = 0  # Best chance: known length advantage.
+                elif own_length == int(enemy.length or 0):
+                    priority = 2  # Both may be eliminated in a tie.
+                else:
+                    priority = 3  # Still preferable to a certain wall/body hit.
+                ranked.append((priority, direction))
+                break
+
+        if not ranked:
+            return []
+        best_priority = min(priority for priority, _ in ranked)
+        return [
+            direction
+            for priority, direction in ranked
+            if priority == best_priority
+        ]
+
     def _supervised_move(
         self, game_state: GameState, ppo_direction: Direction | None
     ) -> MoveAction:
         """Prefer PPO when known-safe, otherwise use HungryAgent."""
+        safety_state = self._safety_state(game_state)
         # Calling HungryAgent every turn keeps its food/enemy memory current,
         # even when PPO's move is accepted.
-        hungry_action = self.safety_agent.move(game_state).move
-        known_safe = self._known_safe_directions(game_state)
+        hungry_action = self.safety_agent.move(safety_state).move
+        known_safe = self._known_safe_directions(safety_state)
 
         if ppo_direction is not None and ppo_direction in known_safe:
             chosen = ppo_direction
@@ -272,14 +436,19 @@ class PPOAgent(BaseAgent):
             chosen = hungry_action
             source = "HungryAgent"
         elif known_safe:
-            chosen = known_safe[0]
-            source = "known-safe fallback"
+            chosen = random.choice(known_safe)
+            source = "random known-safe fallback"
         else:
-            # Every visible move is unsafe, so any action may die.  HungryAgent
-            # still supplies the least-bad fallback instead of silently forcing
-            # UP in every failure case.
-            chosen = hungry_action
-            source = "no-known-safe-move fallback"
+            head_to_head = self._head_to_head_directions(safety_state)
+            if head_to_head:
+                chosen = random.choice(head_to_head)
+                source = "random head-to-head fallback"
+            else:
+                # Every direction is known to be unsafe and there is no
+                # head-to-head chance, so randomise across all four instead
+                # of always forcing one fixed direction such as UP.
+                chosen = random.choice(list(Direction))
+                source = "random no-known-safe fallback"
 
         if ppo_direction is not None and chosen != ppo_direction:
             logger.warning(
@@ -300,6 +469,7 @@ class PPOAgent(BaseAgent):
 
     def start(self, game_state: GameState):
         game_id = game_state.game.id
+        self.obs_builder.clear_cache()
         self.memories[game_id] = ExplicitMemory()
         self.slot_ids[game_id] = {game_state.you.id: 0}
         self._register_snake_slots(game_state)
@@ -307,11 +477,59 @@ class PPOAgent(BaseAgent):
 
     def end(self, game_state: GameState):
         game_id = game_state.game.id
+        self.obs_builder.clear_cache()
         self.memories.pop(game_id, None)
         self.slot_ids.pop(game_id, None)
         self.safety_agent.end(game_state)
 
+    def _emergency_move(self, game_state: GameState) -> MoveAction:
+        """Return a valid move without depending on PPO or HungryAgent."""
+        directions = [
+            Direction.UP,
+            Direction.RIGHT,
+            Direction.DOWN,
+            Direction.LEFT,
+        ]
+        try:
+            board = game_state.board
+            head = game_state.you.head
+            if not self._valid_point(head, board.width, board.height):
+                return MoveAction(move=random.choice(list(Direction)))
+
+            blocked: set[tuple[int, int]] = set()
+            for snake in board.snakes:
+                if not self._snake_is_alive(snake):
+                    continue
+                for part in snake.body:
+                    if self._valid_point(part, board.width, board.height):
+                        blocked.add((part.x, part.y))
+
+            for direction in directions:
+                target = (head.x + direction.dx, head.y + direction.dy)
+                if (
+                    0 <= target[0] < board.width
+                    and 0 <= target[1] < board.height
+                    and target not in blocked
+                ):
+                    return MoveAction(move=direction)
+        except Exception:
+            logger.exception("Emergency move calculation failed")
+        return MoveAction(move=random.choice(list(Direction)))
+
     def move(self, game_state: GameState) -> MoveAction:
+        """Return a move while keeping the HTTP endpoint alive on bad states."""
+        try:
+            return self._move_impl(game_state)
+        except Exception:
+            game = getattr(game_state, "game", None)
+            game_id = getattr(game, "id", "unknown")
+            turn = getattr(game_state, "turn", "unknown")
+            logger.exception(
+                "Unexpected move failure on game=%s turn=%s", game_id, turn
+            )
+            return self._emergency_move(game_state)
+
+    def _move_impl(self, game_state: GameState) -> MoveAction:
         game_id = game_state.game.id
         if game_id not in self.memories:
             self.start(game_state)
@@ -348,7 +566,12 @@ class PPOAgent(BaseAgent):
             if snake_id in slots and slots[snake_id] < game_config.num_players
         }
 
-        if len(snakes_by_slot) < 2:
+        alive_snakes = [
+            snake
+            for snake in snakes_by_slot.values()
+            if self._snake_is_alive(snake)
+        ]
+        if len(alive_snakes) < 2:
             logger.info(
                 "Only one reported snake remains on turn %d; skipping Hisss observation",
                 game_state.turn,
@@ -357,6 +580,8 @@ class PPOAgent(BaseAgent):
 
         occupied: set[tuple[int, int]] = set()
         for snake in current_snakes.values():
+            if not self._snake_is_alive(snake):
+                continue
             for point in snake.body:
                 if self._valid_point(point, game_config.w, game_config.h):
                     occupied.add((int(point.x), int(point.y)))
@@ -367,20 +592,31 @@ class PPOAgent(BaseAgent):
         snake_len: list[int] = []
         for slot in range(game_config.num_players):
             snake = snakes_by_slot.get(slot)
-            if snake is None:
+            if snake is None or not self._snake_is_alive(snake):
                 snakes_alive.append(False)
                 snake_pos[slot] = []
                 snake_health.append(0)
                 snake_len.append(0)
                 continue
 
-            placeholder = self._find_hidden_placeholder(
+            has_hidden_body = self._has_hidden_body(
+                snake,
                 game_config.w,
                 game_config.h,
-                game_state.you.head,
-                game_config.view_radius,
-                occupied,
             )
+            if has_hidden_body:
+                placeholder = self._find_hidden_placeholder(
+                    game_config.w,
+                    game_config.h,
+                    game_state.you.head,
+                    game_config.view_radius,
+                    occupied,
+                )
+                # Reserve the placeholder before constructing the next
+                # snake, so separate hidden bodies cannot overlap.
+                occupied.add(placeholder)
+            else:
+                placeholder = (0, 0)
             body, body_length = self._body_for_hisss(
                 snake, game_state, placeholder
             )
@@ -411,6 +647,7 @@ class PPOAgent(BaseAgent):
                 (int(food.x), int(food.y)) for food in game_state.board.food
             }
             try:
+                self.obs_builder.clear_cache()
                 obs, inverse_action_map = self.obs_builder.observe(
                     env=env,
                     player=0,
@@ -439,6 +676,7 @@ class PPOAgent(BaseAgent):
                 return self._supervised_move(game_state, None)
             return self._supervised_move(game_state, ppo_direction)
         finally:
+            self.obs_builder.clear_cache()
             env.close()
 
 

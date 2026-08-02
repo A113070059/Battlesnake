@@ -1,4 +1,5 @@
 from collections import deque
+from collections import deque
 from dataclasses import dataclass, field
 import heapq
 import numpy as np
@@ -9,16 +10,31 @@ from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent,
 # ---------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------
+def _in_bounds(game_state: GameState, x: int, y: int) -> bool:
+    return 0 <= x < game_state.board.width and 0 <= y < game_state.board.height
+
+
+def _snake_is_alive(snake) -> bool:
+    """Return whether the API marked this snake as eliminated."""
+    return (
+        getattr(snake, "elimination_event", None) is None
+        and getattr(snake, "elimination", None) is None
+    )
+
+
 def get_obstacle_map(game_state: GameState, include_tails: bool = False):
     obstacle_map = np.zeros((game_state.board.height, game_state.board.width), dtype=bool)
     
     for snake in game_state.board.snakes:
+        if not _snake_is_alive(snake):
+            continue
         body = snake.body if include_tails else snake.body[:-1]
         for body_part in body:
             if body_part is None:
                 # we don't see this body section, could be many parts long
                 continue
-            obstacle_map[body_part.y, body_part.x] = 1
+            if _in_bounds(game_state, body_part.x, body_part.y):
+                obstacle_map[body_part.y, body_part.x] = 1
     
     return obstacle_map
 
@@ -95,10 +111,12 @@ def get_future_space(
     # Our tail normally moves away. If we eat this turn, it stays in place.
     if not will_grow and game_state.you.body:
         tail = game_state.you.body[-1]
-        if tail is not None:
+        if tail is not None and _in_bounds(game_state, tail.x, tail.y):
             future_obstacles[tail.y, tail.x] = False
 
     # The new head is the starting cell for the flood fill, not an obstacle.
+    if not _in_bounds(game_state, next_x, next_y):
+        return 0
     future_obstacles[next_y, next_x] = False
     return flood_fill_area(future_obstacles, (next_y, next_x))
 
@@ -127,7 +145,12 @@ def get_enemy_risk(
 
     you_length = game_state.you.length
     for snake in game_state.board.snakes:
-        if snake.id == game_state.you.id or snake.head is None:
+        if (
+            snake.id == game_state.you.id
+            or not _snake_is_alive(snake)
+            or snake.head is None
+            or not _in_bounds(game_state, snake.head.x, snake.head.y)
+        ):
             continue
 
         distance = abs(candidate_x - snake.head.x) + abs(candidate_y - snake.head.y)
@@ -268,19 +291,24 @@ class HungryAgent(BaseAgent):
         current_turn = game_state.turn
 
         for snake in game_state.board.snakes:
-            if snake.id == game_state.you.id:
+            if snake.id == game_state.you.id or not _snake_is_alive(snake):
                 continue
             for body_part in snake.body:
                 if body_part is None:
                     continue
                 position = (body_part.x, body_part.y)
-                visible_enemy_cells.add(position)
-                agent_state.remembered_enemy_cells[position] = current_turn
+                if _in_bounds(game_state, *position):
+                    visible_enemy_cells.add(position)
+                    agent_state.remembered_enemy_cells[position] = current_turn
 
         for position, last_seen_turn in list(agent_state.remembered_enemy_cells.items()):
             x, y = position
             too_old = current_turn - last_seen_turn > 8
-            now_visible_and_empty = vision_mask[y, x] and position not in visible_enemy_cells
+            now_visible_and_empty = (
+                _in_bounds(game_state, x, y)
+                and vision_mask[y, x]
+                and position not in visible_enemy_cells
+            )
             if too_old or now_visible_and_empty:
                 del agent_state.remembered_enemy_cells[position]
 
@@ -298,12 +326,12 @@ class HungryAgent(BaseAgent):
         updated_food = []
         # keep food that is not in vision range in memory
         for food in agent_state.possible_food:
-            if not vision_mask[food.y, food.x]:
+            if _in_bounds(game_state, food.x, food.y) and not vision_mask[food.y, food.x]:
                 updated_food.append(food)
         # add visible food
         visible_food = game_state.board.food
         for food in visible_food:
-            if food not in updated_food:
+            if _in_bounds(game_state, food.x, food.y) and food not in updated_food:
                 updated_food.append(food)
         agent_state.possible_food = updated_food
 
