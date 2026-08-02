@@ -12,7 +12,7 @@ class Point(BaseModel):
     y: int
 
 class Food(Point):
-    spawn_turn: int
+    spawn_turn: Optional[int] = None
 
 class EliminatedCause(str, Enum):
     EliminatedByCollision = "snake-collision"
@@ -30,18 +30,18 @@ class EliminationEvent(BaseModel):
 # Snake Model
 # ---------------------------------------------------------
 class SnakeCustomizations(BaseModel):
-    color: Tuple[int, int, int]
-    head: Optional[str]
-    tail: Optional[str]
+    color: str
+    head: Optional[str] = None
+    tail: Optional[str] = None
 
 class Snake(BaseModel):
     id: str
     name: str
     length: int
-    latency: Optional[str]
-    squad: Optional[str]
-    health: Optional[int]
-    head: Optional[Point]
+    latency: Optional[str] = None
+    squad: Optional[str] = None
+    health: Optional[int] = None
+    head: Optional[Point] = None
     body: List[Optional[Point]]
     customizations: SnakeCustomizations
     elimination_event: Optional[EliminationEvent] = Field(
@@ -68,7 +68,7 @@ class RulesetSettings(BaseModel):
     foodSpawnChance: int
     hazardDamagePerTurn: int
     minimumFood: int
-    viewRadius: Optional[int]
+    viewRadius: Optional[int] = None
     royale: RoyaleSettings
     squad: SquadSettings
 
