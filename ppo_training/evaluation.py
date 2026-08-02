@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from concurrent.futures.process import BrokenProcessPool
 
 from dataclasses import dataclass
 import hashlib
@@ -280,6 +281,8 @@ def evaluate_suites(
                         {**base, "learner_seat": seat}, seat_games, seat_inference
                     )
                     metric_store.append("evaluation_by_seat", seat_row)
+        except BrokenProcessPool as e:
+            print(f"Warning: Evaluation process pool broke: {e}")
         finally:
             metric_store.flush()
             try:
