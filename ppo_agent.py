@@ -1,34 +1,46 @@
-import json
+"""Deploy the trained PPO policy as a Battlesnake Blackout HTTP agent.
+
+The PPO policy is used as the primary decision maker.  A small safety
+supervisor rejects moves that are known to collide with a wall/body or to die
+from the currently visible health/hazard state, then asks HungryAgent for a
+fallback.  Hidden enemy cells are still uncertain: no HTTP agent can prove
+that a move is safe from an enemy that is outside its view.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
-import random
 import sys
-import time
-from pathlib import Path
 
 import numpy as np
 import torch
 
-# Try to import stable_baselines3 and hisss
 try:
     from stable_baselines3 import PPO
-except ImportError:
-    print("Please install stable_baselines3: pip install stable-baselines3")
-    sys.exit(1)
+except ImportError as error:  # pragma: no cover - deployment dependency
+    raise RuntimeError(
+        "PPO deployment requires stable-baselines3 and PyTorch. "
+        "Install the PPO requirements before starting the server."
+    ) from error
 
 try:
     import hisss
     from hisss.game.state import BattleSnakeState
-except ImportError:
-    print("Please install hisss: pip install hisss")
-    sys.exit(1)
+except ImportError as error:  # pragma: no cover - deployment dependency
+    raise RuntimeError("PPO deployment requires hisss==1.2.0") from error
 
-from battlesnake_types import GameState, MoveAction, Direction, BaseAgent
+from battlesnake_types import BaseAgent, Direction, GameState, MoveAction
+from hungry_agent import (
+    HungryAgent,
+    get_hazard_positions,
+    get_legal_directions,
+    get_obstacle_map,
+)
 from ppo_training.config import ExperimentConfig
 from ppo_training.observation import ExplicitMemory, ObservationBuilder
-import torch
 
-# Limit PyTorch to 1 thread to avoid memory fragmentation/SIGABRT (status 134) on constrained environments like Render
+# The Render instance does not need PyTorch parallelism for one move at a time.
 torch.set_num_threads(1)
 
 logger = logging.getLogger(__name__)
@@ -39,196 +51,405 @@ class PPOAgent(BaseAgent):
         super().__init__()
         self.model_path = model_path
         self.config_path = config_path
-        
-        # Load configuration
+
         if not os.path.exists(self.config_path):
-            raise FileNotFoundError(f"Config not found at {self.config_path}")
+            raise FileNotFoundError(
+                f"Config file not found: {os.path.basename(self.config_path)}"
+            )
         self.config = ExperimentConfig.load(self.config_path)
-        
-        # Initialize observation builder
+
         self.obs_builder = ObservationBuilder(self.config)
-        
-        # Load PPO Model
+
         if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"Model not found at {self.model_path}")
-        
-        print(f"Loading PPO model from {self.model_path}...")
-        # Load on CPU for inference to avoid CUDA overhead on web servers
+            raise FileNotFoundError(
+                f"Model file not found: {os.path.basename(self.model_path)}"
+            )
+
+        # The checkpoint contains the custom BlackoutCNN class.  Importing the
+        # module before PPO.load makes its class path resolvable on Render.
+        from ppo_training import network as _network  # noqa: F401
+
+        print(f"Loading PPO model: {os.path.basename(self.model_path)}...")
         self.model = PPO.load(self.model_path, device="cpu")
+        expected_shape = (
+            self.config.input_channels,
+            self.config.observation_size,
+            self.config.observation_size,
+        )
+        actual_shape = tuple(self.model.observation_space.shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                "Model/config observation mismatch: "
+                f"model={actual_shape}, config={expected_shape}"
+            )
         print("Model loaded successfully.")
-        
-        # Memories for Fog of War (game_id -> ExplicitMemory)
-        self.memories = {}
+
+        # One game is normally active on the Battlesnake server, but keeping
+        # these keyed by game id also makes accidental overlapping requests
+        # safe.
+        self.memories: dict[str, ExplicitMemory] = {}
+        self.slot_ids: dict[str, dict[str, int]] = {}
+        self.safety_agent = HungryAgent()
 
     def get_name(self):
         return "PPO Blackout Agent"
 
     def get_color(self):
-        return '#800080'  # Purple
+        return "#800080"
 
     def get_author(self):
         return "RL_Trainer"
 
+    def _register_snake_slots(self, game_state: GameState) -> dict[str, int]:
+        """Keep a stable Hisss player slot for each Battlesnake id."""
+        game_id = game_state.game.id
+        slots = self.slot_ids.setdefault(game_id, {})
+        slots[game_state.you.id] = 0
+
+        for snake in game_state.board.snakes:
+            if snake.id == game_state.you.id or snake.id in slots:
+                continue
+            used = set(slots.values())
+            free_slots = [
+                slot
+                for slot in range(1, self.config.num_players)
+                if slot not in used
+            ]
+            if not free_slots:
+                logger.warning(
+                    "Ignoring snake %s: more than %d snakes were reported",
+                    snake.id,
+                    self.config.num_players,
+                )
+                continue
+            slots[snake.id] = free_slots[0]
+        return slots
+
+    @staticmethod
+    def _valid_point(point, width: int, height: int) -> bool:
+        return (
+            point is not None
+            and 0 <= point.x < width
+            and 0 <= point.y < height
+        )
+
+    @staticmethod
+    def _find_hidden_placeholder(
+        width: int,
+        height: int,
+        head,
+        view_radius: int | None,
+        occupied: set[tuple[int, int]],
+    ) -> tuple[int, int]:
+        """Find a valid fake cell outside our view for unknown body segments."""
+        candidates = [
+            (x, y)
+            for y in range(height)
+            for x in range(width)
+            if (x, y) not in occupied
+        ]
+        if head is not None and view_radius is not None:
+            outside_view = [
+                coordinate
+                for coordinate in candidates
+                if abs(coordinate[0] - head.x) + abs(coordinate[1] - head.y)
+                > view_radius
+            ]
+            if outside_view:
+                return outside_view[0]
+        if candidates:
+            return candidates[0]
+        # A completely full board is already terminal in practice.  Returning
+        # a valid coordinate is still safer than passing an empty body to C++.
+        return (0, 0)
+
+    def _body_for_hisss(
+        self,
+        snake,
+        game_state: GameState,
+        placeholder: tuple[int, int],
+    ) -> tuple[list[tuple[int, int]], int]:
+        """Convert a partial Blackout body without treating None as a death.
+
+        Hisss requires concrete coordinates, while Blackout deliberately sends
+        None for hidden segments.  Known coordinates are retained and unknown
+        segments are represented by an off-screen placeholder, so Hisss can
+        build a correctly shaped observation without inventing visible body
+        cells from the last known segment.
+        """
+        width = game_state.board.width
+        height = game_state.board.height
+        body: list[tuple[int, int]] = []
+        for point in snake.body:
+            if self._valid_point(point, width, height):
+                body.append((int(point.x), int(point.y)))
+            else:
+                body.append(placeholder)
+
+        reported_length = int(snake.length or 0)
+        target_length = max(1, len(body), reported_length)
+        if not body:
+            body = [placeholder]
+        if len(body) < target_length:
+            body.extend([placeholder] * (target_length - len(body)))
+        return body, target_length
+
+    def _known_safe_directions(
+        self, game_state: GameState
+    ) -> list[Direction]:
+        """Return moves that are safe according to currently visible facts."""
+        obstacle_map = get_obstacle_map(game_state)
+        candidates = get_legal_directions(game_state, obstacle_map)
+        head = game_state.you.head
+        if head is None:
+            return []
+
+        food = {
+            (item.x, item.y)
+            for item in game_state.board.food
+            if self._valid_point(item, game_state.board.width, game_state.board.height)
+        }
+        hazards = get_hazard_positions(game_state)
+        health = int(game_state.you.health or 0)
+        hazard_damage = int(
+            game_state.game.ruleset.settings.hazardDamagePerTurn or 0
+        )
+        own_tail = game_state.you.body[-1] if game_state.you.body else None
+        safe: list[Direction] = []
+
+        for direction in candidates:
+            target = (head.x + direction.dx, head.y + direction.dy)
+
+            # HungryAgent intentionally allows a tail move because the tail
+            # normally vacates.  Do not allow it when food keeps the tail in
+            # place, since that collision is immediate.
+            if (
+                own_tail is not None
+                and target == (own_tail.x, own_tail.y)
+                and target in food
+            ):
+                continue
+
+            # Health reaches zero after a non-food move at health 1.  The
+            # hazard check mirrors HungryAgent's conservative rule.
+            grows = target in food
+            if health <= 1 and not grows:
+                continue
+            if target in hazards and health <= hazard_damage + 1 and not grows:
+                continue
+
+            # Avoid visible enemy heads and conservative head-to-head ties.
+            unsafe_head = False
+            for snake in game_state.board.snakes:
+                if snake.id == game_state.you.id or snake.head is None:
+                    continue
+                enemy_head = (snake.head.x, snake.head.y)
+                distance = abs(target[0] - enemy_head[0]) + abs(
+                    target[1] - enemy_head[1]
+                )
+                if distance == 0 or (
+                    distance == 1 and int(snake.length or 0) >= int(game_state.you.length)
+                ):
+                    unsafe_head = True
+                    break
+            if not unsafe_head:
+                safe.append(direction)
+        return safe
+
+    def _supervised_move(
+        self, game_state: GameState, ppo_direction: Direction | None
+    ) -> MoveAction:
+        """Prefer PPO when known-safe, otherwise use HungryAgent."""
+        # Calling HungryAgent every turn keeps its food/enemy memory current,
+        # even when PPO's move is accepted.
+        hungry_action = self.safety_agent.move(game_state).move
+        known_safe = self._known_safe_directions(game_state)
+
+        if ppo_direction is not None and ppo_direction in known_safe:
+            chosen = ppo_direction
+            source = "PPO"
+        elif hungry_action in known_safe:
+            chosen = hungry_action
+            source = "HungryAgent"
+        elif known_safe:
+            chosen = known_safe[0]
+            source = "known-safe fallback"
+        else:
+            # Every visible move is unsafe, so any action may die.  HungryAgent
+            # still supplies the least-bad fallback instead of silently forcing
+            # UP in every failure case.
+            chosen = hungry_action
+            source = "no-known-safe-move fallback"
+
+        if ppo_direction is not None and chosen != ppo_direction:
+            logger.warning(
+                "Rejected PPO move %s on turn %d; using %s (%s)",
+                ppo_direction.value,
+                game_state.turn,
+                chosen.value,
+                source,
+            )
+        else:
+            logger.info(
+                "Accepted %s move %s on turn %d",
+                source,
+                chosen.value,
+                game_state.turn,
+            )
+        return MoveAction(move=chosen)
+
     def start(self, game_state: GameState):
-        """start is called when the battlesnake begins a game"""
-        self.memories[game_state.game.id] = ExplicitMemory()
-        
+        game_id = game_state.game.id
+        self.memories[game_id] = ExplicitMemory()
+        self.slot_ids[game_id] = {game_state.you.id: 0}
+        self._register_snake_slots(game_state)
+        self.safety_agent.start(game_state)
+
     def end(self, game_state: GameState):
-        """end is called when the battlesnake finishes a game"""
-        if game_state.game.id in self.memories:
-            del self.memories[game_state.game.id]
+        game_id = game_state.game.id
+        self.memories.pop(game_id, None)
+        self.slot_ids.pop(game_id, None)
+        self.safety_agent.end(game_state)
 
     def move(self, game_state: GameState) -> MoveAction:
-        """move is called on every turn and returns your next move"""
         game_id = game_state.game.id
         if game_id not in self.memories:
-            self.memories[game_id] = ExplicitMemory()
-            
+            self.start(game_state)
         memory = self.memories[game_id]
-        
+        slots = self._register_snake_slots(game_state)
+
         game_config = hisss.restricted_standard_config()
-        game_config.h = game_state.board.height
-        game_config.w = game_state.board.width
+        game_config.h = int(game_state.board.height)
+        game_config.w = int(game_state.board.width)
+        game_config.num_players = int(self.config.num_players)
+        game_config.min_food = int(self.config.minimum_food)
+        game_config.food_spawn_chance = int(self.config.food_spawn_chance)
         game_config.all_actions_legal = True
-        
-        # Override config settings if needed
-        if hasattr(game_state.game.ruleset, 'settings') and hasattr(game_state.game.ruleset.settings, 'viewRadius'):
-            game_config.view_radius = game_state.game.ruleset.settings.viewRadius or self.config.view_radius
-        
-        env = hisss.BattleSnakeGame(game_config)
-        
-        snakes_alive = []
-        snake_pos = {}
-        snake_health = []
-        snake_len = []
-        
-        # Order snakes: YOU are always index 0
-        snakes_list = [game_state.you]
-        for s in game_state.board.snakes:
-            if s.id != game_state.you.id:
-                snakes_list.append(s)
-                
-        num_players = game_config.num_players
-        alive_count = 0
-        
-        for i in range(num_players):
-            if i < len(snakes_list):
-                s = snakes_list[i]
-                is_alive = True
-                
-                # Filter out None values and out-of-bounds coordinates
-                body = [
-                    (p.x, p.y) for p in s.body 
-                    if p is not None and 0 <= p.x < game_config.w and 0 <= p.y < game_config.h
-                ]
-                
-                # If snake has no valid body parts, it's effectively dead to hisss
-                if not body:
-                    is_alive = False
-                    body = []
-                else:
-                    alive_count += 1
-                    # Pad body to match s.length to avoid C++ out-of-bounds read in hisss
-                    # In Fog of War, Battlesnake might send only the visible parts of the body,
-                    # but s.length reflects the true length.
-                    while len(body) < s.length:
-                        body.append(body[-1])
-                    
-                snakes_alive.append(is_alive)
-                snake_pos[i] = body
-                snake_health.append(s.health if s.health is not None else 0)
-                snake_len.append(s.length)
-            else:
+
+        settings = game_state.game.ruleset.settings
+        configured_view_radius = getattr(settings, "viewRadius", None)
+        game_config.view_radius = (
+            self.config.view_radius
+            if configured_view_radius is None
+            else int(configured_view_radius)
+        )
+
+        current_snakes = {game_state.you.id: game_state.you}
+        current_snakes.update(
+            {
+                snake.id: snake
+                for snake in game_state.board.snakes
+                if snake.id != game_state.you.id
+            }
+        )
+        snakes_by_slot = {
+            slots[snake_id]: snake
+            for snake_id, snake in current_snakes.items()
+            if snake_id in slots and slots[snake_id] < game_config.num_players
+        }
+
+        if len(snakes_by_slot) < 2:
+            logger.info(
+                "Only one reported snake remains on turn %d; skipping Hisss observation",
+                game_state.turn,
+            )
+            return self._supervised_move(game_state, None)
+
+        occupied: set[tuple[int, int]] = set()
+        for snake in current_snakes.values():
+            for point in snake.body:
+                if self._valid_point(point, game_config.w, game_config.h):
+                    occupied.add((int(point.x), int(point.y)))
+
+        snakes_alive: list[bool] = []
+        snake_pos: dict[int, list[tuple[int, int]]] = {}
+        snake_health: list[int] = []
+        snake_len: list[int] = []
+        for slot in range(game_config.num_players):
+            snake = snakes_by_slot.get(slot)
+            if snake is None:
                 snakes_alive.append(False)
-                snake_pos[i] = []
+                snake_pos[slot] = []
                 snake_health.append(0)
                 snake_len.append(0)
-                
-        # If there are fewer than 2 snakes alive, hisss will throw an error on get_obs()
-        if alive_count < 2:
-            print(f"[{game_id}] Turn {game_state.turn}: Only 1 snake alive. Falling back to UP.")
-            return MoveAction(move=Direction.UP)
+                continue
+
+            placeholder = self._find_hidden_placeholder(
+                game_config.w,
+                game_config.h,
+                game_state.you.head,
+                game_config.view_radius,
+                occupied,
+            )
+            body, body_length = self._body_for_hisss(
+                snake, game_state, placeholder
+            )
+            snakes_alive.append(True)
+            snake_pos[slot] = body
+            reported_health = int(snake.health) if snake.health is not None else 100
+            snake_health.append(max(1, reported_health))
+            snake_len.append(body_length)
 
         food_pos = [
-            [f.x, f.y] for f in game_state.board.food 
-            if 0 <= f.x < game_config.w and 0 <= f.y < game_config.h
+            [int(food.x), int(food.y)]
+            for food in game_state.board.food
+            if self._valid_point(food, game_config.w, game_config.h)
         ]
-        
         state = BattleSnakeState(
-            turn=game_state.turn,
+            turn=int(game_state.turn),
             snakes_alive=snakes_alive,
             snake_pos=snake_pos,
             food_pos=food_pos,
             snake_health=snake_health,
-            snake_len=snake_len
+            snake_len=snake_len,
         )
-        
-        env.set_state(state)
-        
-        # Track newly announced food (food visible this turn)
-        # For a simple web server deployment without history, we can just use all current food.
-        # It's an approximation, but ObservationBuilder will update memory correctly.
-        current_food_set = {(f.x, f.y) for f in game_state.board.food}
-        
+
+        env = hisss.BattleSnakeGame(game_config)
         try:
-            obs, inverse_action_map = self.obs_builder.observe(
-                env=env,
-                player=0, # We placed 'you' at index 0
-                memory=memory,
-                announced_food=current_food_set,
-                symmetry=0
+            env.set_state(state)
+            current_food_set = {
+                (int(food.x), int(food.y)) for food in game_state.board.food
+            }
+            try:
+                obs, inverse_action_map = self.obs_builder.observe(
+                    env=env,
+                    player=0,
+                    memory=memory,
+                    announced_food=current_food_set,
+                    symmetry=0,
+                )
+            except ValueError as error:
+                logger.exception("Could not build PPO observation: %s", error)
+                return self._supervised_move(game_state, None)
+
+            action_idx, _ = self.model.predict(
+                np.expand_dims(obs, axis=0), deterministic=True
             )
-        except ValueError as e:
-            if "terminal Hisss game" in str(e):
-                print("CRASH DETECTED! DUMPING HISSS STATE:")
-                print(f"snakes_alive: {snakes_alive}")
-                print(f"snake_pos: {snake_pos}")
-                print(f"snake_health: {snake_health}")
-                print(f"snake_len: {snake_len}")
-                print(f"food_pos: {food_pos}")
-                print(f"w: {game_config.w}, h: {game_config.h}, num_players: {game_config.num_players}")
-                import sys
-                sys.stdout.flush()
-                # Fallback to UP if hisss fails to avoid crashing the whole turn (though C++ might still crash on GC)
-                return MoveAction(move=Direction.UP)
-            raise
-        
-        # Predict move
-        # PPO predict expects a batched observation, so we add a batch dimension
-        action_idx, _ = self.model.predict(np.expand_dims(obs, axis=0), deterministic=True)
-        
-        # Extract scalar
-        action_idx = int(action_idx.item())
-        
-        # Map integer to Direction
-        # In hisss, actions are: 0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
-        action_map = {
-            int(hisss.UP): Direction.UP,
-            int(hisss.RIGHT): Direction.RIGHT,
-            int(hisss.DOWN): Direction.DOWN,
-            int(hisss.LEFT): Direction.LEFT
-        }
-        
-        original_action = inverse_action_map[action_idx]
-        chosen_direction = action_map.get(original_action, Direction.UP)
-        
-        print(f"[{game_id}] Turn {game_state.turn}: PPO chose {chosen_direction.value}")
-        return MoveAction(move=chosen_direction)
+            transformed_action = int(np.asarray(action_idx).reshape(-1)[0])
+            original_action = inverse_action_map.get(transformed_action)
+            action_map = {
+                int(hisss.UP): Direction.UP,
+                int(hisss.RIGHT): Direction.RIGHT,
+                int(hisss.DOWN): Direction.DOWN,
+                int(hisss.LEFT): Direction.LEFT,
+            }
+            ppo_direction = action_map.get(original_action)
+            if ppo_direction is None:
+                logger.error("PPO returned invalid action index %s", transformed_action)
+                return self._supervised_move(game_state, None)
+            return self._supervised_move(game_state, ppo_direction)
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":
-    import sys
     from battlesnake_server import start_server
 
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <port>")
-        sys.exit(1)
-
-    # Initialize agent
     model_path = os.path.join(os.path.dirname(__file__), "ppo_model.zip")
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    
     agent = PPOAgent(model_path=model_path, config_path=config_path)
-    
-    port = int(sys.argv[1])
-    start_server(agent=agent, port=port)
+
+    # Render supplies PORT through the environment.  A positional argument is
+    # still supported for local execution.
+    port_value = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PORT", "10000")
+    start_server(agent=agent, port=int(port_value))
