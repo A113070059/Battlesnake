@@ -2,7 +2,7 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
-name: Build and deploy Python app to Azure Web App - battlesnake-MeinKraft
+name: Build and deploy Python app to Azure Web App - battlesnake-Meinkraft
 
 on:
   push:
@@ -61,6 +61,6 @@ jobs:
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'battlesnake-MeinKraft'
+          app-name: 'battlesnake-Meinkraft'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_CAF94DDE13174951A43A12974A5DB5EF }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_6CF0555B9AE046C4AA0AEA859EFCD30E }}
