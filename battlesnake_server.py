@@ -7,7 +7,6 @@ from flask import request
 from battlesnake_types import GameState, BaseAgent
 
 
-@staticmethod
 def start_server(agent: BaseAgent, port):
     if port is None:
         raise ValueError('please select your port')
