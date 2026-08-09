@@ -30,7 +30,7 @@ class EliminationEvent(BaseModel):
 # Snake Model
 # ---------------------------------------------------------
 class SnakeCustomizations(BaseModel):
-    color: str
+    color: str | list
     head: Optional[str] = None
     tail: Optional[str] = None
 
