@@ -422,14 +422,14 @@ class PPOAgent(BaseAgent):
     def _supervised_move(
         self, game_state: GameState, ppo_direction: Direction | None
     ) -> MoveAction:
-        """Prefer PPO when known-safe, otherwise use HungryAgent."""
+        """Use PPO if available, otherwise use HungryAgent."""
         safety_state = self._safety_state(game_state)
         # Calling HungryAgent every turn keeps its food/enemy memory current,
         # even when PPO's move is accepted.
         hungry_action = self.safety_agent.move(safety_state).move
         known_safe = self._known_safe_directions(safety_state)
 
-        if ppo_direction is not None and ppo_direction in known_safe:
+        if ppo_direction is not None:
             chosen = ppo_direction
             source = "PPO"
         elif hungry_action in known_safe:
